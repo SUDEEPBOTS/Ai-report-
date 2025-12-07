@@ -278,23 +278,43 @@ async def tg_rep_count(u, c):
     target = get_from_db(u.message.from_user.id).get('target_link')
     status = await u.message.reply_text(f"🚀 Reporting {target} with {count} accounts...")
     
-    accs = list(tg_sessions_collection.find({}))[:count]; success = 0
+        accs = list(tg_sessions_collection.find({}))[:count]
+    success = 0
+    
     for i, acc in enumerate(accs):
         try:
-            cl = TelegramClient(StringSession(acc['session']), int(acc['api_id']), acc['api_hash']); await cl.connect()
+            cl = TelegramClient(StringSession(acc['session']), int(acc['api_id']), acc['api_hash'])
+            await cl.connect()
             ent = await cl.get_entity(target)
+            
+            # --- Indentation Fixed Here ---
             try:
-    await cl(functions.channels.JoinChannelRequest(ent))
-except:
-    pass
-            await cl(functions.account.ReportPeerRequest(peer=ent, reason=types.InputReportReasonSpam(), message="Illegal")); success += 1
-            await cl.disconnect()
-            if i > 0 and i % 2 == 0: await status.edit_text(f"🚀 Progress: {i+1}/{len(accs)}")
-            time.sleep(5)
-        except: pass
-    await status.edit_text(f"🏁 TG Report Done: {success}/{count}"); return ConversationHandler.END
+                await cl(functions.channels.JoinChannelRequest(ent))
+            except:
+                pass
+            # ------------------------------
 
-async def cancel(u, c): await u.message.reply_text("❌ Cancelled."); return ConversationHandler.END
+            await cl(functions.account.ReportPeerRequest(
+                peer=ent, 
+                reason=types.InputReportReasonSpam(), 
+                message="Illegal"
+            ))
+            success += 1
+            await cl.disconnect()
+            
+            if i > 0 and i % 2 == 0: 
+                await status.edit_text(f"🚀 Progress: {i+1}/{len(accs)}")
+            
+            time.sleep(5)
+        except: 
+            pass
+
+    await status.edit_text(f"🏁 TG Report Done: {success}/{count}")
+    return ConversationHandler.END
+
+async def cancel(u, c): 
+    await u.message.reply_text("❌ Cancelled.")
+    return ConversationHandler.END
 
 # --- MAIN BLOCK ---
 if __name__ == "__main__":
