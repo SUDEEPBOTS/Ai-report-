@@ -283,7 +283,10 @@ async def tg_rep_count(u, c):
         try:
             cl = TelegramClient(StringSession(acc['session']), int(acc['api_id']), acc['api_hash']); await cl.connect()
             ent = await cl.get_entity(target)
-            try: await cl(functions.channels.JoinChannelRequest(ent)); except: pass
+            try:
+    await cl(functions.channels.JoinChannelRequest(ent))
+except:
+    pass
             await cl(functions.account.ReportPeerRequest(peer=ent, reason=types.InputReportReasonSpam(), message="Illegal")); success += 1
             await cl.disconnect()
             if i > 0 and i % 2 == 0: await status.edit_text(f"🚀 Progress: {i+1}/{len(accs)}")
