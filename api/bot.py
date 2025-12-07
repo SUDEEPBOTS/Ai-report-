@@ -278,7 +278,7 @@ async def tg_rep_count(u, c):
     target = get_from_db(u.message.from_user.id).get('target_link')
     status = await u.message.reply_text(f"🚀 Reporting {target} with {count} accounts...")
     
-        accs = list(tg_sessions_collection.find({}))[:count]
+    accs = list(tg_sessions_collection.find({}))[:count]
     success = 0
     
     for i, acc in enumerate(accs):
