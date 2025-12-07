@@ -29,7 +29,7 @@ ADMIN_ID = 6356015122
 
 # --- SETUP ---
 genai.configure(api_key=GEMINI_KEY)
-model = genai.GenerativeModel('gemini-1.5-flash', generation_config={"response_mime_type": "application/json"})
+model = genai.GenerativeModel('gemini-2.5-flash', generation_config={"response_mime_type": "application/json"})
 
 # MongoDB Connection
 try:
@@ -129,7 +129,7 @@ async def report_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         data = get_from_db(user_id)
         img = await get_image_data(data['photo_id'], context.bot)
         prompt = "Short verdict" if mode == "short" else "Detailed professional analysis"
-        text_model = genai.GenerativeModel('gemini-1.5-flash')
+        text_model = genai.GenerativeModel('gemini-2.5-flash')
         response = text_model.generate_content([{'mime_type': 'image/jpeg', 'data': img}, prompt])
         # USE SAFE EDIT HERE
         await safe_edit_text(query, f"✅ Report:\n\n`{response.text}`")
