@@ -48,7 +48,6 @@ ASK_LINK, ASK_ID, ASK_CONTENT = range(3)
 ADMIN_ASK_EMAIL, ADMIN_ASK_PASS = range(3, 5)
 TG_API_ID, TG_API_HASH, TG_PHONE, TG_OTP = range(5, 9)
 TG_REP_LINK, TG_REP_COUNT = range(9, 11)
-
 # --- HANDLERS (Photo & Callbacks) ---
 
 async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
