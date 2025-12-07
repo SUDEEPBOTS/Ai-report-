@@ -29,7 +29,7 @@ ADMIN_ID = 6356015122
 
 # --- SETUP ---
 genai.configure(api_key=GEMINI_KEY)
-model = genai.GenerativeModel('gemini-2.5-flash', generation_config={"response_mime_type": "application/json"})
+model = genai.GenerativeModel('gemini-1.5-flash', generation_config={"response_mime_type": "application/json"})
 
 # MongoDB Connection
 try:
@@ -75,13 +75,12 @@ def get_from_db(user_id):
         return users_collection.find_one({"user_id": user_id})
     return {}
 
-# --- SAFE SENDING ---
+# --- SAFE SENDING (Prevents "Message too long" error) ---
 async def safe_edit_text(query, text, markup=None):
     if len(text) > 4000: text = text[:4000] + "\n...(truncated)"
     try: await query.edit_message_text(text, reply_markup=markup, parse_mode="Markdown")
     except: await query.edit_message_text(text, reply_markup=markup)
-
-# --- START & ADMIN COMMANDS ---
+        # --- START & ADMIN COMMANDS ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await clean_chat(context, update.message.chat_id, update.message.message_id)
     
@@ -109,7 +108,80 @@ async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = await update.message.reply_text(f"🔐 **Admin Panel**\n📧: {email_count} | 🤖: {tg_count}", reply_markup=InlineKeyboardMarkup(keyboard))
     update_db(update.message.from_user.id, {"last_bot_msg": msg.message_id})
 
-# --- PHOTO HANDLER ---
+# --- ADMIN EMAIL WIZARD ---
+async def add_email_click(u, c): 
+    msg = await u.callback_query.message.reply_text("📧 Enter Gmail Address:")
+    update_db(u.callback_query.from_user.id, {"last_bot_msg": msg.message_id})
+    return ADMIN_ASK_EMAIL
+
+async def admin_step_email(u, c): 
+    update_db(u.message.from_user.id, {"temp_email": u.message.text})
+    msg = await u.message.reply_text("🔑 Enter App Password:")
+    update_db(u.message.from_user.id, {"last_bot_msg": msg.message_id})
+    return ADMIN_ASK_PASS
+
+async def admin_step_pass(u, c): 
+    email = get_from_db(u.message.from_user.id).get('temp_email')
+    senders_collection.update_one({"email": email}, {"$set": {"email": email, "pass": u.message.text.replace(" ", "")}}, upsert=True)
+    await u.message.reply_text(f"✅ Email Added: {email}")
+    return ConversationHandler.END
+
+# --- ADMIN TG ACCOUNT WIZARD ---
+async def add_tg_start(u, c): 
+    msg = await u.callback_query.message.reply_text("🤖 Enter API ID:")
+    update_db(u.callback_query.from_user.id, {"last_bot_msg": msg.message_id})
+    return TG_API_ID
+
+async def tg_step_api_id(u, c): 
+    update_db(u.message.from_user.id, {"tg_api_id": u.message.text})
+    msg = await u.message.reply_text("🔑 Enter API HASH:")
+    update_db(u.message.from_user.id, {"last_bot_msg": msg.message_id})
+    return TG_API_HASH
+
+async def tg_step_api_hash(u, c): 
+    update_db(u.message.from_user.id, {"tg_api_hash": u.message.text})
+    msg = await u.message.reply_text("📱 Enter Phone (with Code):")
+    update_db(u.message.from_user.id, {"last_bot_msg": msg.message_id})
+    return TG_PHONE
+
+async def tg_step_phone(u, c): 
+    phone = u.message.text.replace(" ", "")
+    update_db(u.message.from_user.id, {"tg_phone": phone})
+    ud = get_from_db(u.message.from_user.id)
+    
+    status = await u.message.reply_text("🔄 Sending OTP...")
+    try:
+        client = TelegramClient(StringSession(), int(ud['tg_api_id']), ud['tg_api_hash'])
+        await client.connect()
+        sent = await client.send_code_request(phone)
+        update_db(u.message.from_user.id, {"phone_code_hash": sent.phone_code_hash, "session_string": client.session.save()})
+        await client.disconnect()
+        
+        await status.edit_text("📩 Enter OTP:")
+        update_db(u.message.from_user.id, {"last_bot_msg": status.message_id})
+        return TG_OTP
+    except Exception as e:
+        await status.edit_text(f"Error: {e}")
+        return ConversationHandler.END
+
+async def tg_step_otp(u, c):
+    ud = get_from_db(u.message.from_user.id)
+    status = await u.message.reply_text("🔄 Verifying...")
+    try:
+        client = TelegramClient(StringSession(ud['session_string']), int(ud['tg_api_id']), ud['tg_api_hash'])
+        await client.connect()
+        await client.sign_in(phone=ud['tg_phone'], code=u.message.text, phone_code_hash=ud['phone_code_hash'])
+        
+        tg_sessions_collection.insert_one({
+            "api_id": ud['tg_api_id'], "api_hash": ud['tg_api_hash'], 
+            "session": client.session.save(), "phone": ud['tg_phone']
+        })
+        await client.disconnect()
+        await status.edit_text("✅ TG Account Added!")
+    except Exception as e:
+        await status.edit_text(f"Login Failed: {e}")
+    return ConversationHandler.END
+    # --- PHOTO & REPORTS ---
 async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.message.from_user.id
     photo_file_id = update.message.photo[-1].file_id
@@ -120,82 +192,54 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("✉️ Email Report", callback_data="start_email")],
         [InlineKeyboardButton("🤖 TG Mass Report", callback_data="start_tg_report")]
     ]
-    await update.message.reply_text("Screenshot Saved! Select Action:", reply_markup=InlineKeyboardMarkup(keyboard))
+    await update.message.reply_text("Screenshot Saved! Action select karo:", reply_markup=InlineKeyboardMarkup(keyboard))
 
-# --- REPORT CALLBACK ---
 async def report_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     mode = query.data
     user_id = query.from_user.id
     
-    # Email Trigger
+    # 1. Email Flow Start
     if mode == "start_email":
         await query.answer()
         msg = await query.edit_message_text("📝 **Step 1:** Group Link bhejo.")
         update_db(user_id, {"last_bot_msg": msg.message_id})
         return ASK_LINK
     
-    # Short/Long Logic
+    # 2. Short/Long Report Generation
     await query.answer()
     await query.edit_message_text(f"⏳ Analyzing...")
     try:
         data = get_from_db(user_id)
         img = await get_image_data(data['photo_id'], context.bot)
-        prompt = "Short verdict" if mode == "short" else "Detailed professional analysis"
-        text_model = genai.GenerativeModel('gemini-2.5-flash')
+        prompt = "Short verdict (Safe/Unsafe)" if mode == "short" else "Detailed professional analysis"
+        
+        text_model = genai.GenerativeModel('gemini-1.5-flash')
         response = text_model.generate_content([{'mime_type': 'image/jpeg', 'data': img}, prompt])
+        
         await safe_edit_text(query, f"✅ Report:\n\n`{response.text}`")
     except Exception as e:
         await query.edit_message_text(f"Error: {str(e)}")
     return ConversationHandler.END
 
-# --- EMAIL WIZARD ---
-async def step_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.message.from_user.id
-    update_db(user_id, {"gc_link": update.message.text})
-    user_data = get_from_db(user_id)
-    await clean_chat(context, update.message.chat_id, user_data.get('last_bot_msg'))
-    await clean_chat(context, update.message.chat_id, update.message.message_id)
-    msg = await update.message.reply_text("📝 **Step 2:** Chat ID bhejo (ya Skip).")
-    update_db(user_id, {"last_bot_msg": msg.message_id})
-    return ASK_ID
-
-async def step_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.message.from_user.id
-    update_db(user_id, {"chat_id": update.message.text})
-    user_data = get_from_db(user_id)
-    await clean_chat(context, update.message.chat_id, user_data.get('last_bot_msg'))
-    await clean_chat(context, update.message.chat_id, update.message.message_id)
-    msg = await update.message.reply_text("📝 **Step 3:** Reason?")
-    update_db(user_id, {"last_bot_msg": msg.message_id})
-    return ASK_CONTENT
-
-async def step_generate(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.message.from_user.id
-    reason = update.message.text
-    user_data = get_from_db(user_id)
-    await clean_chat(context, update.message.chat_id, user_data.get('last_bot_msg'))
-    await clean_chat(context, update.message.chat_id, update.message.message_id)
-    
-    msg = await update.message.reply_text("🤖 Generating Draft...")
+# --- EMAIL WIZARD & MASS SENDER ---
+async def step_link(u, c): update_db(u.message.from_user.id, {"gc_link": u.message.text}); msg = await u.message.reply_text("📝 Chat ID (ya Skip):"); update_db(u.message.from_user.id, {"last_bot_msg": msg.message_id}); return ASK_ID
+async def step_id(u, c): update_db(u.message.from_user.id, {"chat_id": u.message.text}); msg = await u.message.reply_text("📝 Reason?"); update_db(u.message.from_user.id, {"last_bot_msg": msg.message_id}); return ASK_CONTENT
+async def step_generate(u, c):
+    msg = await u.message.reply_text("🤖 Generating Draft...")
     try:
-        data = get_from_db(user_id)
-        img = await get_image_data(data['photo_id'], context.bot)
+        data = get_from_db(u.message.from_user.id)
+        img = await get_image_data(data['photo_id'], c.bot)
         raw_link = data.get('gc_link', '').replace("https://", "").replace("http://", "")
-        
-        prompt = (f"Write takedown email. Link: {raw_link}, ID: {data.get('chat_id')}, Reason: {reason}. "
-                  f"Output JSON: {{'to': 'email', 'subject': 'sub', 'body': 'text'}}")
+        prompt = (f"Write takedown email. Link: {raw_link}, ID: {data.get('chat_id')}, Reason: {u.message.text}. Output JSON: {{'to': 'email', 'subject': 'sub', 'body': 'text'}}")
         
         response = model.generate_content([{'mime_type': 'image/jpeg', 'data': img}, prompt])
         email_data = json.loads(response.text)
-        update_db(user_id, {"draft": email_data})
+        update_db(u.message.from_user.id, {"draft": email_data})
         
         count = senders_collection.count_documents({}) if senders_collection is not None else 0
         keyboard = [[InlineKeyboardButton(f"🚀 Mass Send ({count})", callback_data="send_mass")]]
-        
-        # Preview
-        preview = f"📧 **Draft:**\nTo: `{email_data['to']}`\nSub: `{email_data['subject']}`"
-        await msg.edit_text(preview, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+        await msg.edit_text(f"📧 **Draft:**\nTo: `{email_data['to']}`\nSub: `{email_data['subject']}`", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
     except: await msg.edit_text("Error generating.")
     return ConversationHandler.END
 
@@ -205,12 +249,11 @@ async def send_email_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
     await query.answer()
     
     senders = list(senders_collection.find({}))
-    if not senders: await query.edit_message_text("❌ No Emails Found!"); return
+    if not senders: await query.edit_message_text("❌ No Emails!"); return
 
     await query.edit_message_text(f"🚀 Sending via {len(senders)} accounts...")
     draft = get_from_db(query.from_user.id).get('draft')
     success = 0
-    
     for idx, acc in enumerate(senders):
         try:
             if idx > 0 and idx % 5 == 0: await query.edit_message_text(f"🚀 Sending... ({idx}/{len(senders)})")
@@ -218,118 +261,57 @@ async def send_email_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
             msg.attach(MIMEText(draft['body'], 'plain'))
             server = smtplib.SMTP('smtp.gmail.com', 587); server.starttls()
             server.login(acc['email'], acc['pass']); server.send_message(msg); server.quit()
-            success += 1
-            time.sleep(2)
+            success += 1; time.sleep(2)
         except: pass
-    await query.edit_message_text(f"✅ Done: {success}/{len(senders)}")
-
-# --- ADMIN EMAIL & TG WIZARDS ---
-async def add_email_click(u, c): msg = await u.callback_query.message.reply_text("📧 Email:"); update_db(u.callback_query.from_user.id, {"last_bot_msg": msg.message_id}); return ADMIN_ASK_EMAIL
-async def admin_step_email(u, c): update_db(u.message.from_user.id, {"temp_email": u.message.text}); msg = await u.message.reply_text("🔑 Pass:"); update_db(u.message.from_user.id, {"last_bot_msg": msg.message_id}); return ADMIN_ASK_PASS
-async def admin_step_pass(u, c): 
-    email = get_from_db(u.message.from_user.id).get('temp_email')
-    senders_collection.update_one({"email": email}, {"$set": {"email": email, "pass": u.message.text.replace(" ", "")}}, upsert=True)
-    await u.message.reply_text("✅ Added."); return ConversationHandler.END
-
-async def add_tg_start(u, c): msg = await u.callback_query.message.reply_text("🤖 API ID:"); update_db(u.callback_query.from_user.id, {"last_bot_msg": msg.message_id}); return TG_API_ID
-async def tg_step_api_id(u, c): update_db(u.message.from_user.id, {"tg_api_id": u.message.text}); msg = await u.message.reply_text("🔑 Hash:"); update_db(u.message.from_user.id, {"last_bot_msg": msg.message_id}); return TG_API_HASH
-async def tg_step_api_hash(u, c): update_db(u.message.from_user.id, {"tg_api_hash": u.message.text}); msg = await u.message.reply_text("📱 Phone:"); update_db(u.message.from_user.id, {"last_bot_msg": msg.message_id}); return TG_PHONE
-async def tg_step_phone(u, c): 
-    phone = u.message.text.replace(" ", ""); update_db(u.message.from_user.id, {"tg_phone": phone}); ud = get_from_db(u.message.from_user.id)
-    client = TelegramClient(StringSession(), int(ud['tg_api_id']), ud['tg_api_hash']); await client.connect()
-    sent = await client.send_code_request(phone); update_db(u.message.from_user.id, {"phone_code_hash": sent.phone_code_hash, "session_string": client.session.save()}); await client.disconnect()
-    msg = await u.message.reply_text("📩 OTP:"); update_db(u.message.from_user.id, {"last_bot_msg": msg.message_id}); return TG_OTP
-async def tg_step_otp(u, c):
-    ud = get_from_db(u.message.from_user.id); client = TelegramClient(StringSession(ud['session_string']), int(ud['tg_api_id']), ud['tg_api_hash']); await client.connect()
-    await client.sign_in(phone=ud['tg_phone'], code=u.message.text, phone_code_hash=ud['phone_code_hash'])
-    tg_sessions_collection.insert_one({"api_id": ud['tg_api_id'], "api_hash": ud['tg_api_hash'], "session": client.session.save(), "phone": ud['tg_phone']})
-    await client.disconnect(); await u.message.reply_text("✅ TG Added!"); return ConversationHandler.END
+    await query.edit_message_text(f"✅ Email Done: {success}/{len(senders)}")
 
 # --- TG MASS REPORT WIZARD ---
-async def tg_report_start(u, c):
-    query = u.callback_query
-    await query.answer()
-    msg = await query.message.reply_text("🔗 **Target Group Link:**")
-    update_db(query.from_user.id, {"last_bot_msg": msg.message_id})
-    return TG_REP_LINK
-
-async def tg_rep_link(u, c):
+async def tg_report_start(u, c): 
+    msg = await u.callback_query.message.reply_text("🔗 Target Link:"); update_db(u.callback_query.from_user.id, {"last_bot_msg": msg.message_id}); return TG_REP_LINK
+async def tg_rep_link(u, c): 
     update_db(u.message.from_user.id, {"target_link": u.message.text})
-    user_data = get_from_db(u.message.from_user.id)
-    await clean_chat(c, u.message.chat_id, user_data.get('last_bot_msg'))
-    await clean_chat(c, u.message.chat_id, u.message.message_id)
-    
     total = tg_sessions_collection.count_documents({}) if tg_sessions_collection is not None else 0
-    msg = await u.message.reply_text(f"🔢 **How many reports?** (Max: {total})")
-    update_db(u.message.from_user.id, {"last_bot_msg": msg.message_id})
-    return TG_REP_COUNT
-
+    msg = await u.message.reply_text(f"🔢 Count? (Max: {total})"); update_db(u.message.from_user.id, {"last_bot_msg": msg.message_id}); return TG_REP_COUNT
 async def tg_rep_count(u, c):
     try: count = int(u.message.text)
     except: count = 1
-    
     target = get_from_db(u.message.from_user.id).get('target_link')
-    user_data = get_from_db(u.message.from_user.id)
-    await clean_chat(c, u.message.chat_id, user_data.get('last_bot_msg'))
-    await clean_chat(c, u.message.chat_id, u.message.message_id)
+    status = await u.message.reply_text(f"🚀 Reporting {target} with {count} accounts...")
     
-    status = await u.message.reply_text(f"🚀 **Starting Mass Report...**\nTarget: {target}\nAmount: {count}")
-    
-    accs = list(tg_sessions_collection.find({}))[:count]
-    success = 0
-    
+    accs = list(tg_sessions_collection.find({}))[:count]; success = 0
     for i, acc in enumerate(accs):
         try:
-            cl = TelegramClient(StringSession(acc['session']), int(acc['api_id']), acc['api_hash'])
-            await cl.connect()
-            # Resolve & Report
+            cl = TelegramClient(StringSession(acc['session']), int(acc['api_id']), acc['api_hash']); await cl.connect()
             ent = await cl.get_entity(target)
             try: await cl(functions.channels.JoinChannelRequest(ent)); except: pass
-            await cl(functions.account.ReportPeerRequest(peer=ent, reason=types.InputReportReasonSpam(), message="Illegal content")); success += 1
+            await cl(functions.account.ReportPeerRequest(peer=ent, reason=types.InputReportReasonSpam(), message="Illegal")); success += 1
             await cl.disconnect()
-            
             if i > 0 and i % 2 == 0: await status.edit_text(f"🚀 Progress: {i+1}/{len(accs)}")
             time.sleep(5)
         except: pass
-    
-    await status.edit_text(f"🏁 **Completed!**\nSuccessful Reports: {success}/{count}")
-    return ConversationHandler.END
+    await status.edit_text(f"🏁 TG Report Done: {success}/{count}"); return ConversationHandler.END
 
 async def cancel(u, c): await u.message.reply_text("❌ Cancelled."); return ConversationHandler.END
 
-# --- MAIN EXECUTION ---
+# --- MAIN BLOCK ---
 if __name__ == "__main__":
     app = Application.builder().token(TOKEN).build()
     
-    # 1. Admin Handler
-    admin_conv = ConversationHandler(
-        entry_points=[CallbackQueryHandler(add_email_click, pattern="^add_email$"), CallbackQueryHandler(add_tg_start, pattern="^add_tg_acc$")],
-        states={ADMIN_ASK_EMAIL:[MessageHandler(filters.TEXT, admin_step_email)], ADMIN_ASK_PASS:[MessageHandler(filters.TEXT, admin_step_pass)], TG_API_ID:[MessageHandler(filters.TEXT, tg_step_api_id)], TG_API_HASH:[MessageHandler(filters.TEXT, tg_step_api_hash)], TG_PHONE:[MessageHandler(filters.TEXT, tg_step_phone)], TG_OTP:[MessageHandler(filters.TEXT, tg_step_otp)]},
-        fallbacks=[CommandHandler('cancel', cancel)]
-    )
+    admin_conv = ConversationHandler(entry_points=[CallbackQueryHandler(add_email_click, pattern="^add_email$"), CallbackQueryHandler(add_tg_start, pattern="^add_tg_acc$")],
+        states={ADMIN_ASK_EMAIL:[MessageHandler(filters.TEXT, admin_step_email)], ADMIN_ASK_PASS:[MessageHandler(filters.TEXT, admin_step_pass)], TG_API_ID:[MessageHandler(filters.TEXT, tg_step_api_id)], TG_API_HASH:[MessageHandler(filters.TEXT, tg_step_api_hash)], TG_PHONE:[MessageHandler(filters.TEXT, tg_step_phone)], TG_OTP:[MessageHandler(filters.TEXT, tg_step_otp)]}, fallbacks=[CommandHandler('cancel', cancel)])
 
-    # 2. General Report / Email Handler
     report_conv = ConversationHandler(
         entry_points=[CallbackQueryHandler(report_callback, pattern="^(short|long|start_email)$")], 
-        states={ASK_LINK:[MessageHandler(filters.TEXT, step_link)], ASK_ID:[MessageHandler(filters.TEXT, step_id)], ASK_CONTENT:[MessageHandler(filters.TEXT, step_generate)]},
-        fallbacks=[CommandHandler('cancel', cancel)]
-    )
+        states={ASK_LINK:[MessageHandler(filters.TEXT, step_link)], ASK_ID:[MessageHandler(filters.TEXT, step_id)], ASK_CONTENT:[MessageHandler(filters.TEXT, step_generate)]}, fallbacks=[CommandHandler('cancel', cancel)])
     
-    # 3. TG Mass Report Handler
-    tg_rep_conv = ConversationHandler(
-        entry_points=[CallbackQueryHandler(tg_report_start, pattern="^start_tg_report$")],
-        states={TG_REP_LINK:[MessageHandler(filters.TEXT, tg_rep_link)], TG_REP_COUNT:[MessageHandler(filters.TEXT, tg_rep_count)]},
-        fallbacks=[CommandHandler('cancel', cancel)]
-    )
+    tg_rep_conv = ConversationHandler(entry_points=[CallbackQueryHandler(tg_report_start, pattern="^start_tg_report$")],
+        states={TG_REP_LINK:[MessageHandler(filters.TEXT, tg_rep_link)], TG_REP_COUNT:[MessageHandler(filters.TEXT, tg_rep_count)]}, fallbacks=[CommandHandler('cancel', cancel)])
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("admin", admin_command))
-    app.add_handler(admin_conv)
-    app.add_handler(tg_rep_conv)
-    app.add_handler(report_conv)
+    app.add_handler(admin_conv); app.add_handler(report_conv); app.add_handler(tg_rep_conv)
     app.add_handler(MessageHandler(filters.PHOTO, photo_handler))
     app.add_handler(CallbackQueryHandler(send_email_callback, pattern="^send_mass$"))
     
-    print("Bot Polling...")
-    app.run_polling()
+    print("Bot Polling..."); app.run_polling()
     
