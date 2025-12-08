@@ -229,6 +229,121 @@ async def tg_report_start(u, c):
     return TG_ASK_LINK
 
 async def tg_ask_link(u, c):
+# --- PHOTO HANDLER ---
+async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.message.from_user.id
+    photo_file_id = update.message.photo[-1].file_id
+    update_db(user_id, {"photo_id": photo_file_id})
+    
+    keyboard = [
+        [InlineKeyboardButton("⚡ Short Report", callback_data="short"), InlineKeyboardButton("📊 Long Report", callback_data="long")],
+        [InlineKeyboardButton("✉️ Email Report", callback_data="start_email")],
+        [InlineKeyboardButton("🤖 TG Mass Report", callback_data="start_tg_report"), InlineKeyboardButton("⏳ Timer Report", callback_data="start_timer")]
+    ]
+    await update.message.reply_text("Select Action:", reply_markup=InlineKeyboardMarkup(keyboard))
+
+# --- INDEPENDENT HANDLERS (Short/Long) ---
+async def button_callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    mode = query.data
+    user_id = query.from_user.id
+    
+    if mode in ["short", "long"]:
+        await query.answer()
+        await query.edit_message_text(f"⏳ Analyzing...")
+        try:
+            data = get_from_db(user_id)
+            img = await get_image_data(data['photo_id'], context.bot)
+            prompt = "Short verdict" if mode == "short" else "Detailed analysis"
+            response = model.generate_content([{'mime_type': 'image/jpeg', 'data': img}, prompt])
+            await safe_edit_text(query, f"✅ Report:\n\n`{response.text}`")
+        except: 
+            await query.edit_message_text("Error.")
+        return ConversationHandler.END
+    return ConversationHandler.END
+
+# --- NEW: TIMER REPORT LOGIC ---
+async def timer_start(u, c):
+    await u.callback_query.answer()
+    msg = await u.callback_query.edit_message_text("⏳ **Timer Mode:**\nTarget GC Link bhejo:")
+    update_db(u.callback_query.from_user.id, {"last_bot_msg": msg.message_id})
+    return TG_TIMER_LINK
+
+async def timer_logic_start(u, c):
+    user_id = u.message.from_user.id
+    target = u.message.text
+    
+    if user_id in active_timers:
+        await u.message.reply_text("⚠️ Ek Timer pehle se chal raha hai! Pehle use roko.")
+        return ConversationHandler.END
+
+    msg = await u.message.reply_text(f"✅ **Timer Started!**\nTarget: {target}\nReporting every 30s...", 
+                                     reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🛑 Stop Timer", callback_data="stop_timer")]]))
+    
+    task = asyncio.create_task(run_timer_background(c.bot, user_id, target))
+    active_timers[user_id] = task
+    return ConversationHandler.END
+
+async def run_timer_background(bot, user_id, target):
+    try:
+        round_count = 1
+        while True:
+            accs = list(tg_sessions_collection.find({}))
+            if not accs: 
+                await bot.send_message(user_id, "❌ No Accounts Found! Timer Stopped.")
+                break
+            
+            success = 0
+            for acc in accs:
+                try:
+                    cl = TelegramClient(StringSession(acc['session']), int(acc['api_id']), acc['api_hash'])
+                    await cl.connect()
+                    ent = await cl.get_entity(target)
+                    
+                    # Fix: Correct Try/Except Block
+                    try: 
+                        await cl(functions.channels.JoinChannelRequest(ent))
+                    except: 
+                        pass
+                        
+                    await cl(functions.account.ReportPeerRequest(peer=ent, reason=types.InputReportReasonSpam(), message="Illegal content"))
+                    success += 1
+                    await cl.disconnect()
+                except: 
+                    pass
+            
+            try: 
+                await bot.send_message(user_id, f"⏰ **Round {round_count} Done!**\n✅ Reports Sent: {success}\nWaiting 30s...")
+            except: 
+                pass 
+            
+            round_count += 1
+            await asyncio.sleep(30)
+            
+    except asyncio.CancelledError:
+        pass
+    finally:
+        if user_id in active_timers: del active_timers[user_id]
+
+async def stop_timer_callback(u, c):
+    query = u.callback_query
+    user_id = query.from_user.id
+    if user_id in active_timers:
+        active_timers[user_id].cancel()
+        del active_timers[user_id]
+        await query.answer("Stopped!")
+        await query.edit_message_text("🛑 **Timer Stopped Successfully.**")
+    else:
+        await query.answer("No active timer found.")
+
+# --- TG MASS REPORT (Regular vs Multiple) ---
+async def tg_report_start(u, c):
+    await u.callback_query.answer()
+    msg = await u.callback_query.edit_message_text("🔗 **Target Group Link:**")
+    update_db(u.callback_query.from_user.id, {"last_bot_msg": msg.message_id})
+    return TG_ASK_LINK
+
+async def tg_ask_link(u, c):
     update_db(u.message.from_user.id, {"target_link": u.message.text})
     keyboard = [[InlineKeyboardButton("🔹 Regular (1x)", callback_data="mode_reg"), InlineKeyboardButton("🔁 Multiple (Loop)", callback_data="mode_mul")]]
     msg = await u.message.reply_text("⚙️ **Select Mode:**", reply_markup=InlineKeyboardMarkup(keyboard))
@@ -257,12 +372,18 @@ async def execute_tg_logic(obj, context, user_id):
         try:
             cl = TelegramClient(StringSession(acc['session']), int(acc['api_id']), acc['api_hash']); await cl.connect()
             ent = await cl.get_entity(target)
-            try: await cl(functions.channels.JoinChannelRequest(ent)); except: pass
+            
+            # Fix: Correct Try/Except Block
+            try: 
+                await cl(functions.channels.JoinChannelRequest(ent))
+            except: 
+                pass
             
             for _ in range(loop_count):
                 try:
                     await cl(functions.account.ReportPeerRequest(peer=ent, reason=types.InputReportReasonSpam(), message="Illegal")); success += 1
                 except: failed += 1
+                
                 if (success + failed) % 2 == 0:
                     try: await status_msg.edit_text(f"📡 **Live:**\n✅: {success} | ❌: {failed}")
                     except: pass
@@ -273,27 +394,50 @@ async def execute_tg_logic(obj, context, user_id):
     await status_msg.edit_text(f"🏁 **Finished!**\n✅ Success: {success}\n❌ Failed: {failed}")
     return ConversationHandler.END
 
-# --- EMAIL FLOW (Re-added) ---
-async def start_email_flow(u, c): await u.callback_query.answer(); msg = await u.callback_query.edit_message_text("📝 Link:"); update_db(u.callback_query.from_user.id, {"last_bot_msg": msg.message_id}); return ASK_LINK
-async def step_link(u, c): update_db(u.message.from_user.id, {"gc_link": u.message.text}); msg = await u.message.reply_text("📝 Chat ID:"); update_db(u.message.from_user.id, {"last_bot_msg": msg.message_id}); return ASK_ID
-async def step_id(u, c): update_db(u.message.from_user.id, {"chat_id": u.message.text}); msg = await u.message.reply_text("📝 Reason?"); update_db(u.message.from_user.id, {"last_bot_msg": msg.message_id}); return ASK_CONTENT
+# --- EMAIL FLOW ---
+async def start_email_flow(u, c): 
+    await u.callback_query.answer()
+    msg = await u.callback_query.edit_message_text("📝 Link:")
+    update_db(u.callback_query.from_user.id, {"last_bot_msg": msg.message_id})
+    return ASK_LINK
+
+async def step_link(u, c): 
+    update_db(u.message.from_user.id, {"gc_link": u.message.text})
+    msg = await u.message.reply_text("📝 Chat ID:")
+    update_db(u.message.from_user.id, {"last_bot_msg": msg.message_id})
+    return ASK_ID
+
+async def step_id(u, c): 
+    update_db(u.message.from_user.id, {"chat_id": u.message.text})
+    msg = await u.message.reply_text("📝 Reason?")
+    update_db(u.message.from_user.id, {"last_bot_msg": msg.message_id})
+    return ASK_CONTENT
+
 async def step_generate(u, c):
-    msg = await u.message.reply_text("🤖 Generating..."); user_id = u.message.from_user.id
+    msg = await u.message.reply_text("🤖 Generating...")
+    user_id = u.message.from_user.id
     try:
-        data = get_from_db(user_id); img = await get_image_data(data['photo_id'], c.bot); raw = data.get('gc_link', '').replace("https://","")
+        data = get_from_db(user_id)
+        img = await get_image_data(data['photo_id'], c.bot)
+        raw = data.get('gc_link', '').replace("https://","")
         prompt = f"Write takedown email. Link: {raw}, ID: {data.get('chat_id')}, Reason: {u.message.text}. Output JSON: {{'to': 'email', 'subject': 'sub', 'body': 'text'}}"
         response = model.generate_content([{'mime_type': 'image/jpeg', 'data': img}, prompt])
-        email_data = json.loads(response.text); update_db(user_id, {"draft": email_data})
-        count = senders_collection.count_documents({}); kb = [[InlineKeyboardButton(f"🚀 Send ({count})", callback_data="send_mass")]]
+        email_data = json.loads(response.text)
+        update_db(user_id, {"draft": email_data})
+        count = senders_collection.count_documents({})
+        kb = [[InlineKeyboardButton(f"🚀 Send ({count})", callback_data="send_mass")]]
         await msg.edit_text(f"📧 **Draft:**\nTo: `{email_data['to']}`", reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
-    except: await msg.edit_text("Error.")
+    except: 
+        await msg.edit_text("Error.")
     return ConversationHandler.END
 
 async def send_email_action(u, c):
     if u.callback_query.data != "send_mass": return
-    await u.callback_query.answer(); senders = list(senders_collection.find({}))
+    await u.callback_query.answer()
+    senders = list(senders_collection.find({}))
     await u.callback_query.edit_message_text(f"🚀 Sending...")
-    draft = get_from_db(u.callback_query.from_user.id).get('draft'); success = 0
+    draft = get_from_db(u.callback_query.from_user.id).get('draft')
+    success = 0
     for acc in senders:
         try:
             s = smtplib.SMTP('smtp.gmail.com', 587); s.starttls(); s.login(acc['email'], acc['pass'])
@@ -321,4 +465,5 @@ if __name__ == "__main__":
     app.add_handler(MessageHandler(filters.PHOTO, photo_handler))
     
     print("Bot Polling..."); app.run_polling()
+
         
