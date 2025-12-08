@@ -119,6 +119,7 @@ async def tg_step_otp(u, c):
     await client.sign_in(phone=ud['tg_phone'], code=u.message.text, phone_code_hash=ud['phone_code_hash'])
     tg_sessions_collection.insert_one({"api_id": ud['tg_api_id'], "api_hash": ud['tg_api_hash'], "session": client.session.save(), "phone": ud['tg_phone']})
     await client.disconnect(); await u.message.reply_text("✅ TG Added!"); return ConversationHandler.END
+    
     # --- PHOTO HANDLER ---
 async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.message.from_user.id
